@@ -1,0 +1,15 @@
+*~
+*.log
+*.rs.bk
+*.swp
+*.swo
+.classpath
+.DS_Store
+.env
+.env.*
+.fleet/
+.idea/
+.project
+.settings/
+.vscode/
+target/

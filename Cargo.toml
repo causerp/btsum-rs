@@ -1,0 +1,14 @@
+[package]
+categories = ["command-line-utilities"]
+description = "Deterministic BitTorrent identity tool"
+edition = "2024"
+keywords = ["bittorrent", "torrent", "magnet", "sha1", "sha256"]
+license = "MIT-0"
+name = "btsum"
+readme = "README.md"
+version = "1.0.0"
+
+[dependencies]
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help"] }
+sha1 = "0.11.0"
+sha2 = "0.11.1"

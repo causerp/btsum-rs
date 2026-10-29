@@ -1,0 +1,226 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (default: v<crate version from Cargo.toml>)"
+        required: false
+        type: string
+      draft:
+        description: "Create as a draft release"
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark as a pre-release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.version.outputs.name }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        shell: bash
+        run: |
+          META=$(cargo metadata --no-deps --format-version 1)
+          NAME=$(echo "$META" | jq -r '.packages[0].name')
+          VERSION=$(echo "$META" | jq -r '.packages[0].version')
+          echo "name=$NAME"       >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "crate name:    $NAME"
+          echo "crate version: $VERSION"
+      - id: tag
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="v${{ steps.version.outputs.version }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release tag:   $TAG"
+
+  build:
+    name: build / ${{ matrix.target }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_BOOTSTRAP: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux musl — fully static, native cargo.
+          - { target: x86_64-unknown-linux-musl,  tool: cargo }
+          # Linux arm64 musl — zig as linker, native build, fully static.
+          - { target: aarch64-unknown-linux-musl, tool: zig }
+          # Windows x86_64 GNU — mingw-w64, self-contained against msvcrt.
+          - { target: x86_64-pc-windows-gnu,      tool: gnu }
+          # Windows ARM64 GNU (LLVM-MinGW) — prebuilt tarball via taiki-e action.
+          - { target: aarch64-pc-windows-gnullvm, tool: gnullvm }
+          # NOTE: macOS is built in a separate workflow (release-macos.yml)
+          # so a queued or failed macOS runner never blocks this release.
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rust-src          # required by build-std
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # --- Linux x86_64-musl ---------------------------------------------
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      # --- Linux aarch64-musl (zig) --------------------------------------
+      - name: Setup zig
+        if: matrix.tool == 'zig'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.tool == 'zig'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      # --- Windows x86_64 GNU (mingw-w64) --------------------------------
+      - name: Install mingw-w64
+        if: matrix.tool == 'gnu'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mingw-w64
+
+      # --- Windows ARM64 GNU (LLVM-MinGW) --------------------------------
+      - name: Setup gnullvm toolchain
+        if: matrix.tool == 'gnullvm'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      # --- Builds --------------------------------------------------------
+      - name: Build (cargo)
+        if: matrix.tool == 'cargo'
+        run: cargo build --locked --config ./.cargo/release.toml --release --target ${{ matrix.target }}
+
+      - name: Build (zig)
+        if: matrix.tool == 'zig'
+        run: cargo zigbuild --locked --config ./.cargo/release.toml --release --target ${{ matrix.target }}
+
+      - name: Build (gnu)
+        if: matrix.tool == 'gnu'
+        run: cargo build --locked --config ./.cargo/release.toml --release --target ${{ matrix.target }}
+
+      - name: Build (gnullvm)
+        if: matrix.tool == 'gnullvm'
+        run: cargo build --locked --config ./.cargo/release.toml --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+      # --- Package -------------------------------------------------------
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG='${{ needs.prepare.outputs.tag }}'
+          NAME='${{ needs.prepare.outputs.name }}'
+          TARGET='${{ matrix.target }}'
+          mkdir -p dist staging
+          cp README.md License.txt SPEC.md staging/ 2>/dev/null || true
+
+          if [[ "$TARGET" == *windows* ]]; then
+            cp "target/${TARGET}/release/${NAME}.exe" staging/
+            ARCHIVE="${NAME}-${TAG}-${TARGET}.zip"
+            ( cd staging && zip -r9 "../dist/${ARCHIVE}" . )
+          else
+            cp "target/${TARGET}/release/${NAME}" staging/
+            ARCHIVE="${NAME}-${TAG}-${TARGET}.tar.gz"
+            tar -czf "dist/${ARCHIVE}" -C staging .
+          fi
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            ( cd dist && sha256sum "$ARCHIVE" > "SHA256SUMS-${TARGET}" )
+          else
+            ( cd dist && shasum -a 256 "$ARCHIVE" > "SHA256SUMS-${TARGET}" )
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ needs.prepare.outputs.name }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release ${{ needs.prepare.outputs.tag }}
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write   # required to dispatch release-macos.yml via workflow_dispatch
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Merge checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cat SHA256SUMS-* | sort -k2 > SHA256SUMS
+          rm -f SHA256SUMS-*
+          echo "Release contents:"
+          ls -la
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.name }} ${{ needs.prepare.outputs.tag }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+
+      # GitHub suppresses `release: published` events that originate from the
+      # default GITHUB_TOKEN (to prevent recursive workflows). workflow_dispatch
+      # is exempt, so we explicitly kick off the macOS workflow here instead of
+      # relying on the release event.
+      - name: Trigger macOS release workflow
+        if: ${{ !inputs.draft }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run release-macos.yml \
+            --repo "${{ github.repository }}" \
+            -f tag="$TAG"
+          echo "dispatched release-macos.yml for $TAG"

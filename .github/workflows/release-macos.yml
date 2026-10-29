@@ -1,0 +1,89 @@
+name: Release macOS
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach to (e.g. v1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+
+jobs:
+  build-macos:
+    name: build macos arm64
+    runs-on: macos-26
+    env:
+      RUSTC_BOOTSTRAP: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          git checkout "$TAG"
+          META=$(cargo metadata --no-deps --format-version 1)
+          NAME=$(echo "$META" | jq -r '.packages[0].name')
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "tag: $TAG"
+          echo "name: $NAME"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin
+
+      - name: Build
+        run: cargo build --locked --config ./.cargo/release.toml --release --target aarch64-apple-darwin
+
+      - name: Package and upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          set -euo pipefail
+          TARGET=aarch64-apple-darwin
+          mkdir -p dist staging
+          cp README.md License.txt SPEC.md staging/ 2>/dev/null || true
+          cp "target/${TARGET}/release/${NAME}" staging/
+          ARCHIVE="${NAME}-${TAG}-${TARGET}.tar.gz"
+          tar -czf "dist/${ARCHIVE}" -C staging .
+          shasum -a 256 "dist/${ARCHIVE}" | ( cd dist && sed "s|dist/||" > "SHA256SUMS-${TARGET}" )
+
+          gh release upload "$TAG" "dist/${ARCHIVE}" --clobber
+
+          # Merge our line into the master SHA256SUMS asset.
+          gh release download "$TAG" -p SHA256SUMS -D dist --clobber || true
+          if [ -f dist/SHA256SUMS ]; then
+            cat dist/SHA256SUMS "dist/SHA256SUMS-${TARGET}" | sort -k2 -u > dist/SHA256SUMS.new
+          else
+            cp "dist/SHA256SUMS-${TARGET}" dist/SHA256SUMS.new
+          fi
+          mv dist/SHA256SUMS.new dist/SHA256SUMS
+          gh release upload "$TAG" dist/SHA256SUMS --clobber
+
+          echo "Release assets:"
+          gh release view "$TAG" --json assets --jq '.assets[].name' | sort
